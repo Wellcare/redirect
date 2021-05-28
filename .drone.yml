@@ -1,0 +1,75 @@
+kind: pipeline
+type: docker
+name: build
+
+workspace:
+  base: /drone
+  path: /drone/src
+
+steps:
+  - name: build image
+    image: docker:dind
+    pull: if-not-exists
+    volumes:
+    - name: dockersock
+      path: /var/run/docker.sock
+    environment:
+      DOCKER_USERNAME: 
+        from_secret: DOCKER_USERNAME
+      DOCKER_PASSWORD: 
+        from_secret: DOCKER_PASSWORD
+    commands:
+      - docker login -u $${DOCKER_USERNAME} -p $${DOCKER_PASSWORD}
+      - docker build --rm -t mhealthvn/redirect:${DRONE_COMMIT} . --build-arg GIT_COMMIT=${DRONE_COMMIT} --build-arg GIT_BRANCH=${DRONE_BRANCH} --build-arg GIT_TOKEN=${GIT_TOKEN} --build-arg DRONE_REPO_NAME=${DRONE_REPO_NAME}
+
+trigger:
+  branch:
+    - main
+  event:
+    - push
+    - tag
+          
+volumes:
+- name: dockersock
+  host:
+    path: /var/run/docker.sock
+
+---
+kind: pipeline
+type: docker
+name: deploy
+
+depends_on:
+  - build
+
+workspace:
+  base: /drone
+  path: /drone/src
+
+steps:
+  - name: push to registry
+    image: docker:dind
+    pull: if-not-exists
+    volumes:
+    - name: dockersock
+      path: /var/run/docker.sock
+    environment:
+      DOCKER_USERNAME: 
+        from_secret: DOCKER_USERNAME
+      DOCKER_PASSWORD: 
+        from_secret: DOCKER_PASSWORD        
+    commands:
+      - docker login -u $${DOCKER_USERNAME} -p $${DOCKER_PASSWORD}
+      - docker tag mhealthvn/redirect:${DRONE_COMMIT} mhealthvn/redirect:${DRONE_BRANCH} 
+      - docker push mhealthvn/redirect:${DRONE_BRANCH} 
+trigger:
+  branch:
+    - main
+  event:
+    - push
+    - tag
+
+volumes:
+- name: dockersock
+  host:
+    path: /var/run/docker.sock
