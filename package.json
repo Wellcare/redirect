@@ -10,7 +10,7 @@
   "author": "mHealth Technologies Jsc",
   "license": "UNLICENSED",
   "dependencies": {
-    "dotenv": "^10.0.0",
+    "dotenv": "^16.0.0",
     "express": "4.17.1"
   }
 }
