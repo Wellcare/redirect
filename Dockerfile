@@ -1,4 +1,4 @@
-FROM node:16.2-alpine
+FROM node:19.9-alpine
 
 RUN apk update \ 
     && apk upgrade --available \
