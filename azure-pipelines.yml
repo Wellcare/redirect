@@ -1,0 +1,171 @@
+# Build-only pipeline for a containerised service (backend or web application).
+#
+# SCOPE: BUILD ONLY. No image is pushed and nothing is deployed.
+#
+# There is nowhere in the Buyer's Azure to push a container image today — Azure Container Registry
+# requires a subscription the tenant does not have, Azure Artifacts does not host container images,
+# and the project has no registry service connection. Deploy additionally requires AKS, which has
+# the same dependency. Both steps are left for the Buyer to complete; this pipeline proves the
+# image builds from delivered source using only Buyer-controlled inputs.
+#
+# The Seller's Drone pipeline for these services was:
+#     docker build -t mhealthvn/<repo>:<commit> . --build-arg GIT_TOKEN=...
+#     docker push mhealthvn/<repo>:<branch>
+#     kubectl rollout restart deployment <repo> -n backend
+#         (or, for production: commit a release manifest into github.com/Wellcare/kustomize
+#          for ArgoCD to reconcile — a GitOps write-back loop)
+# Only the first step is reproduced.
+#
+# WHY THE DOCKERFILE IS REWRITTEN AT BUILD TIME
+# ---------------------------------------------
+# These Dockerfiles resolve @wellcare/* packages from the SELLER's registry, in two ways:
+#   * implicitly, from the base image — mhealthvn/node-builder bakes in
+#         npm set @wellcare:registry https://npm.pkg.github.com
+#     plus a GIT_TOKEN written into an image layer;
+#   * explicitly, in a few repositories, via `RUN echo "@wellcare:registry=..." >> .npmrc`.
+# Neither works for the Buyer. The transform below copies an .npmrc authenticated against the
+# Buyer's Azure Artifacts feed into each build stage, and removes any line that writes the
+# Seller's registry. The committed Dockerfile is untouched; the rewrite happens on a copy.
+#
+# The feed credential lands only in intermediate build stages. The final stage of these
+# multi-stage builds copies node_modules and dist, never .npmrc, so no token reaches the runtime
+# image — and in any case nothing is pushed.
+
+trigger:
+  branches:
+    include:
+      - pmc
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  HUSKY: '0'
+
+steps:
+  - task: UseNode@1
+    displayName: Use Node 20
+    inputs:
+      version: '20.x'
+
+  # Writes feed credentials into ./.npmrc using the pipeline identity.
+  - task: npmAuthenticate@0
+    displayName: Authenticate Azure Artifacts
+    inputs:
+      workingFile: .npmrc
+
+  - script: |
+      set -e
+      # .dockerignore must not strip .npmrc from the build context, or the build silently falls
+      # back to the base image's Seller registry config. Two shapes appear in the transfer:
+      #   * blacklist  — lists what to exclude (.git, node_modules, ...); .npmrc already survives
+      #   * whitelist  — starts with `**` and re-includes specific paths (`!src`, `!*.ts`, ...);
+      #                  .npmrc is excluded because it was never whitelisted
+      # Appending an explicit negation handles both: last match wins in .dockerignore, and a
+      # negation of something not excluded is a no-op.
+      # yarn v1 aborts when a dependency declares an engine range the base image does not satisfy.
+      # With no lockfiles committed, dependencies resolve to current releases whose engine ranges
+      # postdate these pinned base images — e.g. bson@7.3.2 demands node >=20.19.0 while
+      # mhealthvn/node-builder:20.14 provides 20.14.0. The runtime the code actually needs has not
+      # changed; only what a freshly resolved transitive dependency claims to need.
+      printf 'ignore-engines true\n' > .yarnrc
+      echo "wrote .yarnrc (ignore-engines) for the build context"
+
+      # A committed lockfile that pins the SELLER's registry is worse than no lockfile: the
+      # resolved URL is used literally and .npmrc scope mapping is ignored, so the Buyer gets
+      #     ERR_PNPM_FETCH_403 https://npm.pkg.github.com/download/@Wellcare/common-libs/...
+      # (note the capitalised scope, which no source file declares). 12 submodules across the
+      # transfer commit lockfiles like this. Removed from the build context only; the committed
+      # file is untouched.
+      for L in pnpm-lock.yaml yarn.lock package-lock.json; do
+        if [ -f "$L" ] && grep -q 'npm.pkg.github.com' "$L"; then
+          echo "$L pins the Seller's registry ($(grep -c 'npm.pkg.github.com' "$L") URLs); removing for this build"
+          rm -f "$L"
+        fi
+      done
+
+      if [ -f .dockerignore ]; then
+        grep -vE '^\s*(\.npmrc|\.yarnrc)\s*$' .dockerignore > .dockerignore.tmp && mv .dockerignore.tmp .dockerignore
+        printf '\n!.npmrc\n!.yarnrc\n' >> .dockerignore
+        echo ".dockerignore: ensured .npmrc and .yarnrc reach the build context"
+      fi
+
+      python3 - <<'PY'
+      import re
+      src = open('Dockerfile', encoding='utf-8').read()
+
+      # Drop lines that write the Seller's registry into an in-image .npmrc.
+      src, dropped = re.subn(r'^RUN echo ".*npm\.pkg\.github\.com.*$\n?', '', src, flags=re.M)
+
+      # Copy the authenticated .npmrc and the engine-tolerant .yarnrc into every stage that installs.
+      src, added = re.subn(r'^(COPY package\.json[^\n]*)$',
+                           r'\1\nCOPY .npmrc .yarnrc ./', src, flags=re.M)
+
+      # Pin pnpm. `npm install -g pnpm` fetches the current release, which now refuses to run on
+      # the Node these base images ship: "This version of pnpm requires at least Node.js v22.13"
+      # against a base image on 18.19. pnpm 9 is the last line that supports Node 18.
+      src, pinned = re.subn(r'(npm install -g pnpm)(?!@)', r'\1@9', src)
+
+      # A lockfile pinned to the Seller's registry is removed from the build context above, so a
+      # frozen install would now fail for want of one. Relax it; resolution falls back to the
+      # Buyer's feed via the injected .npmrc.
+      src, thawed = re.subn(r'--frozen-lockfile', '--no-frozen-lockfile', src)
+
+      # ...and drop the COPY that would fetch a lockfile no longer in the context, which otherwise
+      # fails the build outright: `"/pnpm-lock.yaml": not found`. Only lockfiles actually removed
+      # are dropped; one still present is left alone.
+      import os
+      copies = 0
+      for lock in ('pnpm-lock.yaml', 'yarn.lock', 'package-lock.json'):
+          if os.path.exists(lock):
+              continue
+          # Remove the token from any COPY line, then drop the line if nothing is left to copy.
+          new = []
+          for line in src.split('\n'):
+              if line.startswith('COPY ') and lock in line:
+                  stripped = re.sub(rf'(?<=\s){re.escape(lock)}(?=\s|$)', '', line)
+                  stripped = re.sub(r'\s{2,}', ' ', stripped).rstrip()
+                  # A COPY with only a destination left has no sources; drop it.
+                  if re.fullmatch(r'COPY\s+\.?/?', stripped):
+                      copies += 1
+                      continue
+                  copies += 1
+                  new.append(stripped)
+              else:
+                  new.append(line)
+          src = '\n'.join(new)
+
+      open('Dockerfile.buyer', 'w', encoding='utf-8').write(src)
+      print(f'removed {dropped} Seller-registry line(s); injected npmrc/yarnrc after {added} '
+            f'COPY package.json line(s); pinned pnpm in {pinned} place(s); '
+            f'relaxed {thawed} frozen-lockfile flag(s); adjusted {copies} lockfile COPY line(s)')
+      if added == 0:
+          print('WARNING: no COPY package.json found — the build may still resolve from the base image config')
+      PY
+    displayName: Rewrite Dockerfile for the Buyer's feed
+
+  # GIT_TOKEN is passed empty on purpose: the Seller's registry is no longer used, and supplying a
+  # value would only reintroduce the dependency this transform removes.
+  - script: |
+      docker build -f Dockerfile.buyer -t $(Build.Repository.Name):pmc . \
+        --build-arg GIT_COMMIT=$(Build.SourceVersion) \
+        --build-arg GIT_BRANCH=$(Build.SourceBranchName) \
+        --build-arg GIT_TOKEN=
+    displayName: Build image
+
+  - script: |
+      set -e
+      IMAGE=$(Build.Repository.Name):pmc
+      echo "built: $IMAGE"
+      docker image inspect "$IMAGE" --format 'size: {{.Size}} bytes   layers: {{len .RootFS.Layers}}'
+      echo "--- no Seller registry reference should remain in the image npm config ---"
+      if docker run --rm --entrypoint sh "$IMAGE" -c 'npm config list 2>/dev/null || true' | grep -qi 'npm.pkg.github.com'; then
+        echo "##vso[task.logissue type=warning]image npm config still references the Seller's registry"
+      else
+        echo "clean"
+      fi
+    displayName: Verify image
+    continueOnError: true
+
+  # Push and deploy intentionally absent — see the header. To enable, add a Docker registry
+  # service connection and a Docker@2 push task; the image name above is already correct.
